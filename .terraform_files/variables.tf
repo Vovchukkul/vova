@@ -35,10 +35,10 @@ variable "root_domain_name" {}
 variable "cloudfront_price_class" {
   default = "PriceClass_100"
 }
-variable "img_domain_name" {
-  description = "Domain name for images"
-  type        = string
-}
+# variable "img_domain_name" {
+#   description = "Domain name for images"
+#   type        = string
+# }
 
 ############ RDS MODULE ################
 
