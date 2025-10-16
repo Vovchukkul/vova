@@ -1,0 +1,464 @@
+# CircleCI needs variables:
+# AWS_DEFAULT_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, 
+# AWS_ACCOUNT_ID_QA, AWS_ACCOUNT_ID_PRODUCTION,
+# PROJECT_NAME,
+# SONAR_TOKEN
+
+version: 2.1
+orbs:
+  aws-cli: circleci/aws-cli@4.1.3
+  #sonarcloud: sonarsource/sonarcloud@2.0.0
+
+jobs:
+
+  init_update_infrastructure:
+    machine:
+        image: ubuntu-2204:2024.04.4
+    resource_class: medium
+    environment:
+      AWS_CONFIG_FILE: /home/circleci/project/config
+    steps:                                                                  
+      - checkout
+      - aws-cli/setup:
+          profile_name: default
+      - configure_aws_credentials
+      - run:
+          name: Check Changes
+          command: |
+            set -ex
+      
+            export existing_environments=$(aws ssm get-parameter --region $AWS_DEFAULT_REGION --profile root --name "${PROJECT_NAME}-existing-environments-backend" --with-decryption --query 'Parameter.Value' --output text)
+
+            # Check whether the environment exists in the list
+            if echo "$existing_environments" | grep -v -qw "${CIRCLE_BRANCH}"; then
+              echo "This is a new environment called ${CIRCLE_BRANCH}."
+              echo 'export new_environment=true' >> $BASH_ENV
+            else
+              echo "Environment ${CIRCLE_BRANCH} already exists, cheching for updates"
+              echo 'export new_environment=false' >> $BASH_ENV
+              
+              # Check whether terraform files have any updates
+              if git diff --name-status HEAD^ HEAD | grep -q terraform; then
+                echo "The ${CIRCLE_BRANCH} environment needs to be updated"
+                echo 'export update_infra=true' >> $BASH_ENV
+              else
+                echo "The ${CIRCLE_BRANCH} environments has no updates"
+                echo 'export update_infra=false' >> $BASH_ENV
+              fi
+            fi
+
+      - run:
+          name: Setup for new environment
+          command: |
+            set -ex
+            if [[ "$new_environment" == "true" ]]; then
+              echo 'export TF_VAR_app_image=python:alpine' >> $BASH_ENV
+              echo 'export TF_VAR_task_desired_count=0' >> $BASH_ENV
+            fi
+              
+      - run:
+          name: Setup for an environment update
+          command: |
+            set -ex
+            if [[ "$update_infra" == "true" ]]; then
+              # Get current ECR image URL for backend container
+              TASK_DEFINITION_ARN=$(aws ecs describe-services --profile ${CIRCLE_BRANCH} --cluster $ENV-$PROJECT_NAME-backend --services $ENV-$PROJECT_NAME-backend --query 'services[0].taskDefinition' --output text)
+              BACKEND_IMAGE=$(aws ecs describe-task-definition --profile ${CIRCLE_BRANCH} --task-definition $TASK_DEFINITION_ARN --query 'taskDefinition.containerDefinitions[*].image' --output text | sed 's/\t/\n/g' | grep backend)
+              echo "export TF_VAR_app_image=$BACKEND_IMAGE" >> $BASH_ENV
+
+              # Get current ECR image URL for nginx container
+              # NGINX_IMAGE=$(aws ecs describe-task-definition --profile ${CIRCLE_BRANCH} --task-definition $TASK_DEFINITION_ARN --query 'taskDefinition.containerDefinitions[*].image' --output text | sed 's/\t/\n/g' | grep nginx)
+              # echo "export TF_VAR_nginx_image=$NGINX_IMAGE" >> $BASH_ENV
+
+              #Form a list of environment variables
+              # Retrieve parameter names from AWS Systems Manager Parameter Store
+              aws ssm get-parameters-by-path \
+              --profile ${CIRCLE_BRANCH} \
+              --region $AWS_DEFAULT_REGION \
+              --path /be/${CIRCLE_BRANCH}/${PROJECT_NAME}/ \
+              --recursive \
+              --query "Parameters[*].Name" \
+              --output text | sed "s/\t/\n/g; s@/be/${CIRCLE_BRANCH}/${PROJECT_NAME}/@@g" > .env-vars
+
+              # Read the JSON template for container definitions
+              json_data=$(cat .terraform_files/modules/ecs_fargate/templates/container-definitions.json.tpl)
+              secrets_array="[]"
+
+              # Iterate over each parameter name and build the secrets array
+              while IFS= read -r var_name; do
+                secrets_array=$(echo $secrets_array | jq --arg vn "$var_name" --arg vf "/be/${CIRCLE_BRANCH}/${PROJECT_NAME}/$var_name" '. += [{"name": $vn, "valueFrom": $vf}]')
+              done < .env-vars
+
+              # Update the JSON template with the secrets array
+              updated_json=$(echo $json_data | jq --argjson secrets "$secrets_array" '.[0].secrets = $secrets')
+
+              # Save the updated JSON template
+              echo "$updated_json" > '.terraform_files/modules/ecs_fargate/templates/container-definitions.json.tpl'
+
+              # Retrieve secret value from AWS Secrets Manager
+              aws secretsmanager get-secret-value --profile ${CIRCLE_BRANCH} --secret-id "$CIRCLE_BRANCH/$PROJECT_NAME/backend" --region $AWS_DEFAULT_REGION | jq -r '.SecretString' | \
+              jq -r "to_entries|map(\"\(.key)=\\\"\(.value|tostring)\\\"\")|.[]" | cut -f1 -d'=' > .env
+
+              # Get the ARN of the secret from AWS Secrets Manage
+              secrets_manager_arn=$(aws secretsmanager describe-secret --profile ${CIRCLE_BRANCH} --secret-id "$CIRCLE_BRANCH/$PROJECT_NAME/backend" --query 'ARN' --output text)
+
+              # Read the JSON template for container definitions
+              json_data=$(cat '.terraform_files/modules/ecs_fargate/templates/container-definitions.json.tpl')
+
+              # Read each secret name from the .env file and update the JSON template
+              while IFS= read -r var_name; do
+                json_data=$(echo $json_data | jq --arg vn "$var_name" --arg vf "$secrets_manager_arn:$var_name::" '.[0].secrets += [{"name": $vn, "valueFrom": $vf}]')
+              done < .env
+
+              # Save the updated JSON template, overwriting the original file
+              echo "$json_data" > '.terraform_files/modules/ecs_fargate/templates/container-definitions.json.tpl'
+
+              
+              # Retrieve secret value from AWS Secrets Manager for RDS
+              export db_name=${CIRCLE_BRANCH}-${PROJECT_NAME}
+              export secrets_manager=$(aws secretsmanager list-secrets --region $AWS_DEFAULT_REGION --profile ${CIRCLE_BRANCH} | jq -r --arg db_name "$db_name" '.SecretList[] | select(.Description != null and (.Description | contains(":db:" + $db_name))) | .Name') >> $BASH_ENV
+              secrets_manager_arn=$(aws secretsmanager describe-secret --profile ${ENV} --secret-id "$secrets_manager" --query 'ARN' --output text)
+
+              # Read the JSON template for container definitions
+              json_data=$(cat '.terraform_files/modules/ecs_fargate/templates/container-definitions.json.tpl')
+              
+              # Append the database username secret to the JSON template
+              json_data=$(echo $json_data | jq --arg  vf "$secrets_manager_arn:username::" '.[0].secrets += [{"name": "DATABASE_USER", "valueFrom": $vf}]')
+              # Append the database password secret to the JSON template
+              json_data=$(echo $json_data | jq --arg  vf "$secrets_manager_arn:password::" '.[0].secrets += [{"name": "DATABASE_PASSWORD", "valueFrom": $vf}]')
+              
+              # Save the updated JSON template, overwriting the original file
+              echo "$json_data" > '.terraform_files/modules/ecs_fargate/templates/container-definitions.json.tpl'
+            fi
+      - run:
+          name: Run terraform commands
+          command: |
+            set -ex
+            # Install Terrafrom cli
+            wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+            sudo apt update && sudo apt install terraform=1.8.*
+            # Execute Terraform commands if there's a new environment or updates
+            if [[ "$new_environment" == "true" || "$update_infra" == "true" ]]; then
+              cd .terraform_files/
+              terraform init
+              terraform workspace select -or-create=true ${CIRCLE_BRANCH}
+              terraform plan -input=false -var-file=environments/${CIRCLE_BRANCH}.tfvars 
+              terraform apply -auto-approve -var-file=environments/${CIRCLE_BRANCH}.tfvars
+              cd ..
+            fi
+            
+            # Append the new environment to the Parameter Store if it's a new environment
+            export existing_environments=$(aws ssm get-parameter --region $AWS_DEFAULT_REGION --profile root --name "${PROJECT_NAME}-existing-environments-backend" --with-decryption --query 'Parameter.Value' --output text)
+
+            if [[ "$new_environment" == "true" ]]; then
+              # Turn off secrets rotation
+              export db_name=${CIRCLE_BRANCH}-${PROJECT_NAME}
+              secrets_manager=$(aws secretsmanager list-secrets --region $AWS_DEFAULT_REGION --profile ${CIRCLE_BRANCH} | jq -r --arg db_name "$db_name" '.SecretList[] | select(.Description != null and (.Description | contains(":db:" + $db_name))) | .Name')
+              aws secretsmanager cancel-rotate-secret --secret-id $secrets_manager
+
+              # Add environment to the list of existing environments
+              new_environments="${existing_environments}${CIRCLE_BRANCH},"
+              aws ssm put-parameter --region $AWS_DEFAULT_REGION --profile root --name "${PROJECT_NAME}-existing-environments-backend" --value "$new_environments" --type "String" --overwrite
+            fi
+
+  build_docker_image:
+    machine:
+        image: ubuntu-2204:2024.11.1
+    resource_class: medium
+    environment:
+      AWS_CONFIG_FILE: /home/circleci/project/config
+    steps:
+      - checkout
+      - aws-cli/setup:
+          profile_name: default
+      - configure_aws_credentials
+      - run:
+          name: Build Docker image
+          command: |
+            #Login into ECR
+            aws ecr get-login-password --region $AWS_DEFAULT_REGION --profile ${ENV} | docker login --username AWS --password-stdin $account_id.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+            #Prepare Dockerfile
+            AWS_ECR_ID=$account_id.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+            sed -i "s@AWS_ECR_ID@${AWS_ECR_ID}@" deployment/Dockerfile
+            sed -i "s@/ENV@/${ENV}@" deployment/Dockerfile
+            sed -i "s@PROJECT_NAME@${PROJECT_NAME}@" deployment/Dockerfile
+            #Build Dockerfile 
+            docker build -f deployment/Dockerfile . -t ${PROJECT_NAME}-backend
+            docker save -o docker_image_backend.tar ${PROJECT_NAME}-backend
+      - persist_to_workspace:
+          root: ./
+          paths:
+            - ./
+    
+  run_unit_tests:
+    machine:
+        image: ubuntu-2204:2024.11.1
+    resource_class: medium
+    environment:
+      AWS_CONFIG_FILE: /home/circleci/project/config
+    steps:
+      - attach_workspace:
+          at: ./
+      - run:
+          name: Run unit tests
+          command: |
+            set -ex
+            docker load -i docker_image_backend.tar
+            cd deployment/unit-tests/
+
+            # Substitute docker image variable
+            export IMAGE_NAME=${PROJECT_NAME}-backend:latest
+            sed -i "s@IMAGE_NAME@${IMAGE_NAME}@" docker-compose.yml
+
+            docker-compose up -d
+            sleep 20
+            docker exec -u 0 backend sh -c 'set -ex && python -m pytest'
+            
+            # cd ../../
+            # container_id=$(docker ps -qf "name=backend")
+            # docker cp $container_id:/${PROJECT_NAME}/coverage.xml coverage.xml
+            # sed -i 's|<source>/${PROJECT_NAME}</source>|<source>/home/circleci/project/</source>|g' coverage.xml
+      # - sonarcloud/scan
+
+
+  run_database_migrations:
+    machine:
+      image: ubuntu-2204:2024.11.1
+    resource_class: medium
+    environment:
+      AWS_CONFIG_FILE: /home/circleci/project/config
+    steps:
+      - attach_workspace:
+          at: ./
+      - run:
+          name: Create env file for migrations
+          command: |
+            # Pull Environment Variables in Secrets Maanger
+            aws secretsmanager get-secret-value \
+            --profile ${CIRCLE_BRANCH} \
+            --secret-id "$CIRCLE_BRANCH/$PROJECT_NAME/backend" \
+            --region $AWS_DEFAULT_REGION | jq -r '.SecretString' | \
+            jq -r "to_entries|map(\"\(.key)=\\\"\(.value|tostring)\\\"\")|.[]"  > deployment/migrations/.env
+
+            # Pull Environment variables from parameter store
+            aws ssm get-parameters-by-path \
+            --profile ${CIRCLE_BRANCH} \
+            --region $AWS_DEFAULT_REGION \
+            --path /be/${CIRCLE_BRANCH}/${PROJECT_NAME}/ \
+            --with-decryption --recursive \
+            --query "Parameters[*].[Name,Value]" --output text | \
+            awk '{print $1 "=" $2}' | \
+            sed "s/\t/\n/g; s@/be/${CIRCLE_BRANCH}/${PROJECT_NAME}/@@g" >> deployment/migrations/.env
+
+            # Pull DB username and password
+            export db_name=${CIRCLE_BRANCH}-${PROJECT_NAME}
+            export secrets_manager=$(aws secretsmanager list-secrets --region $AWS_DEFAULT_REGION --profile ${CIRCLE_BRANCH} | jq -r --arg db_name "$db_name" '.SecretList[] | select(.Description != null and (.Description | contains(":db:" + $db_name))) | .Name')
+
+            export user_name=$(aws secretsmanager get-secret-value --region $AWS_DEFAULT_REGION --profile ${CIRCLE_BRANCH} --secret-id "$secrets_manager" --query 'SecretString' | jq -r '. | fromjson | .username')
+            export password=$(aws secretsmanager get-secret-value --region $AWS_DEFAULT_REGION --profile ${CIRCLE_BRANCH} --secret-id "$secrets_manager" --query 'SecretString' | jq -r '. | fromjson | .password')
+            echo "DATABASE_USER=$user_name" >> deployment/migrations/.env
+            echo "DATABASE_PASSWORD=$password" >> deployment/migrations/.env 
+
+      - run:
+          name: Run database Migrations
+          command: |
+              set -ex
+              # Install the session manager plugin
+              curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
+              sudo dpkg -i session-manager-plugin.deb
+              # Connect to the bastion host
+              host=$(aws ssm get-parameter --region $AWS_DEFAULT_REGION --profile ${CIRCLE_BRANCH} --name /be/${CIRCLE_BRANCH}/${PROJECT_NAME}/DATABASE_HOST --with-decryption | jq -r '.Parameter.Value')
+              port=$(aws ssm get-parameter --region $AWS_DEFAULT_REGION --profile ${CIRCLE_BRANCH} --name /be/${CIRCLE_BRANCH}/${PROJECT_NAME}/DATABASE_PORT --with-decryption | jq -r '.Parameter.Value')
+              bastion=$(aws ec2 describe-instances --region $AWS_DEFAULT_REGION --profile ${CIRCLE_BRANCH} --query "Reservations[].Instances[?State.Name=='running' && Tags[?Key=='Name' && Value=='${CIRCLE_BRANCH}-${PROJECT_NAME}-bastion']].[InstanceId]" --output text)
+              
+              aws ssm start-session --profile ${CIRCLE_BRANCH} \
+              --region $AWS_DEFAULT_REGION \
+              --target "$bastion" \
+              --document-name AWS-StartPortForwardingSessionToRemoteHost \
+              --parameters host="$host",portNumber="$port",localPortNumber="$port" &
+
+              docker load -i docker_image_backend.tar
+              cd deployment/migrations
+              sed -i "s@IMAGE_NAME@${PROJECT_NAME}-backend@" docker-compose.yml
+              docker-compose up -d
+              docker exec backend sh -c 'set -ex && alembic -c live_charts_app/alembic.ini upgrade head'
+
+
+  deploy_the_application:
+    machine:
+        image: ubuntu-2204:2024.11.1
+    resource_class: medium
+    environment:
+      AWS_CONFIG_FILE: /home/circleci/project/config
+    steps:
+      - attach_workspace:
+          at: ./
+      - configure_aws_credentials
+      - aws-cli/setup:
+          profile_name: default
+      
+      - run:
+          name: Push Docker image to ECR
+          command: |
+            set -ex
+            aws ecr get-login-password --region $AWS_DEFAULT_REGION --profile ${CIRCLE_BRANCH} | docker login --username AWS --password-stdin $account_id.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+            docker load -i docker_image_backend.tar
+            docker tag ${PROJECT_NAME}-backend:latest $account_id.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/${CIRCLE_BRANCH}-${PROJECT_NAME}:backend-<<pipeline.number>>-${CIRCLE_SHA1}
+            docker push $account_id.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/${CIRCLE_BRANCH}-${PROJECT_NAME}:backend-<<pipeline.number>>-${CIRCLE_SHA1}
+      - run:
+          name: Prepare Files for deployment
+          command: |
+            set -ex
+            echo 'export TF_VAR_app_image=$account_id.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/${CIRCLE_BRANCH}-${PROJECT_NAME}:backend-<<pipeline.number>>-${CIRCLE_SHA1}' >> $BASH_ENV
+            #Form a list of environment variables
+            # Retrieve parameter names from AWS Systems Manager Parameter Store
+            aws ssm get-parameters-by-path \
+            --profile ${CIRCLE_BRANCH} \
+            --region $AWS_DEFAULT_REGION \
+            --path /be/${CIRCLE_BRANCH}/${PROJECT_NAME}/ \
+            --recursive \
+            --query "Parameters[*].Name" \
+            --output text | sed "s/\t/\n/g; s@/be/${CIRCLE_BRANCH}/${PROJECT_NAME}/@@g" > .env-vars
+
+            # Read the JSON template for container definitions
+            json_data=$(cat .terraform_files/modules/ecs_fargate/templates/container-definitions.json.tpl)
+            secrets_array="[]"
+
+            # Iterate over each parameter name and build the secrets array
+            while IFS= read -r var_name; do
+              secrets_array=$(echo $secrets_array | jq --arg vn "$var_name" --arg vf "/be/${CIRCLE_BRANCH}/${PROJECT_NAME}/$var_name" '. += [{"name": $vn, "valueFrom": $vf}]')
+            done < .env-vars
+
+            # Update the JSON template with the secrets array
+            updated_json=$(echo $json_data | jq --argjson secrets "$secrets_array" '.[0].secrets = $secrets')
+
+            # Save the updated JSON template
+            echo "$updated_json" > '.terraform_files/modules/ecs_fargate/templates/container-definitions.json.tpl'
+
+            # Retrieve secret value from AWS Secrets Manager
+            aws secretsmanager get-secret-value --profile ${CIRCLE_BRANCH} --secret-id "$CIRCLE_BRANCH/$PROJECT_NAME/backend" --region $AWS_DEFAULT_REGION | jq -r '.SecretString' | \
+            jq -r "to_entries|map(\"\(.key)=\\\"\(.value|tostring)\\\"\")|.[]" | cut -f1 -d'=' > .env
+
+            # Get the ARN of the secret from AWS Secrets Manage
+            secrets_manager_arn=$(aws secretsmanager describe-secret --profile ${CIRCLE_BRANCH} --secret-id "$CIRCLE_BRANCH/$PROJECT_NAME/backend" --query 'ARN' --output text)
+
+            # Read the JSON template for container definitions
+            json_data=$(cat '.terraform_files/modules/ecs_fargate/templates/container-definitions.json.tpl')
+
+            # Read each secret name from the .env file and update the JSON template
+            while IFS= read -r var_name; do
+              json_data=$(echo $json_data | jq --arg vn "$var_name" --arg vf "$secrets_manager_arn:$var_name::" '.[0].secrets += [{"name": $vn, "valueFrom": $vf}]')
+            done < .env
+
+            # Save the updated JSON template, overwriting the original file
+            echo "$json_data" > '.terraform_files/modules/ecs_fargate/templates/container-definitions.json.tpl'
+
+            
+            # Retrieve secret value from AWS Secrets Manager for RDS
+            export db_name=${CIRCLE_BRANCH}-${PROJECT_NAME}
+            export secrets_manager=$(aws secretsmanager list-secrets --region $AWS_DEFAULT_REGION --profile ${CIRCLE_BRANCH} | jq -r --arg db_name "$db_name" '.SecretList[] | select(.Description != null and (.Description | contains(":db:" + $db_name))) | .Name') >> $BASH_ENV
+            secrets_manager_arn=$(aws secretsmanager describe-secret --profile ${ENV} --secret-id "$secrets_manager" --query 'ARN' --output text)
+
+            # Read the JSON template for container definitions
+            json_data=$(cat '.terraform_files/modules/ecs_fargate/templates/container-definitions.json.tpl')
+            
+            # Append the database username secret to the JSON template
+            json_data=$(echo $json_data | jq --arg  vf "$secrets_manager_arn:username::" '.[0].secrets += [{"name": "DATABASE_USER", "valueFrom": $vf}]')
+            # Append the database password secret to the JSON template
+            json_data=$(echo $json_data | jq --arg  vf "$secrets_manager_arn:password::" '.[0].secrets += [{"name": "DATABASE_PASSWORD", "valueFrom": $vf}]')
+            
+            # Save the updated JSON template, overwriting the original file
+            echo "$json_data" > '.terraform_files/modules/ecs_fargate/templates/container-definitions.json.tpl'
+
+      - run:
+          name: Deploy the application
+          command: |
+            set -ex
+            wget -O- https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+            sudo apt update && sudo apt install terraform=1.8.*
+            cd .terraform_files/
+            terraform init
+            terraform workspace select -or-create=true ${CIRCLE_BRANCH}
+            terraform plan -input=false -var-file=environments/${CIRCLE_BRANCH}.tfvars 
+            terraform apply -auto-approve -var-file=environments/${CIRCLE_BRANCH}.tfvars
+      - run:
+          name: Wait for task to be deployed
+          command: |
+            aws ecs wait services-stable \
+            --profile ${CIRCLE_BRANCH} \
+            --cluster ${CIRCLE_BRANCH}-${PROJECT_NAME}-backend \
+            --services ${CIRCLE_BRANCH}-${PROJECT_NAME}-backend \
+            --region $AWS_DEFAULT_REGION            
+
+commands:
+  configure_aws_credentials:
+    steps:
+      - run:
+          name: Set CI/CD Environment varaibles
+          command: |
+            set -ex
+            if [[ "${CIRCLE_BRANCH}" = "production" ]]; then 
+              echo 'export account_id=$AWS_ACCOUNT_ID_PRODUCTION' >> $BASH_ENV
+            else
+              echo 'export account_id=$AWS_ACCOUNT_ID_QA' >> $BASH_ENV
+            fi
+            
+            if [[ "${CIRCLE_BRANCH}" = "production" || "${CIRCLE_BRANCH}" = "staging" || "${CIRCLE_BRANCH}" = "qa" ]]; then
+              echo 'export ENV=${CIRCLE_BRANCH}' >> $BASH_ENV
+            else
+              echo 'export ENV=qa' >> $BASH_ENV
+            fi
+      - run:
+          name: Create AWS Config File
+          command: |
+            echo \
+            "[profile root]
+            aws_access_key_id=$AWS_ACCESS_KEY_ID
+            aws_secret_access_key=$AWS_SECRET_ACCESS_KEY
+            region=$AWS_DEFAULT_REGION
+            output=json
+          
+            [profile $ENV]
+            role_arn = arn:aws:iam::$account_id:role/${PROJECT_NAME}-terraform-backend
+            source_profile = root
+            max_attempts = 10" > config
+
+
+workflows:
+  deploy:
+    jobs:
+      - init_update_infrastructure:
+          filters:
+            branches:
+              only:
+                - qa
+                - staging
+                - production
+      - build_docker_image
+      - run_unit_tests:
+          requires:
+            - build_docker_image
+      - run_database_migrations:
+          requires:
+            - run_unit_tests
+            - init_update_infrastructure
+          filters:
+            branches:
+              only:
+                - qa
+                - staging
+                - production
+      - deploy_the_application:
+          requires:
+            - run_database_migrations
+            - init_update_infrastructure
+          filters:
+            branches:
+              only:
+                - qa
+                - staging
+                - production
+
+

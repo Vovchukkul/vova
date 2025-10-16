@@ -1,0 +1,19 @@
+FROM python:3.12-slim
+
+WORKDIR /vova
+
+RUN set -eux && \
+  	apt-get update &&  \
+  	apt-get upgrade -y && \
+  	apt-get install -y --no-install-recommends \
+        build-essential \  
+        libpq5 && \
+    rm -rf /var/lib/apt/lists/* && \
+	groupadd \
+          --system \
+       vova && \
+      useradd \
+          --system \
+      vova \
+          -g \
+      vova 
