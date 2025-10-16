@@ -15,10 +15,10 @@ module "elasticache-redis" {
   name                       = var.prefix
 }
 
-resource "aws_ssm_parameter" "REDIS_DSN" {
-  name        = "/be/${terraform.workspace}/${var.project_name}/REDIS_DSN"
-  description = "Full redis URL"
-  value       = "redis://${module.elasticache-redis.endpoint}/0"
-  type        = "SecureString"
-  tags        = var.common_tags
-}
+# resource "aws_ssm_parameter" "REDIS_DSN" {
+#   name        = "/be/${terraform.workspace}/${var.project_name}/REDIS_DSN"
+#   description = "Full redis URL"
+#   value       = "redis://${module.elasticache-redis.endpoint}/0"
+#   type        = "SecureString"
+#   tags        = var.common_tags
+# }

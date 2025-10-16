@@ -147,11 +147,11 @@ module "rds" {
 }
 
 
-module "secret_manager" {
-  source       = "./modules/secret_manager"
-  project_name = var.project_name
-  common_tags  = local.common_tags
-}
+# module "secret_manager" {
+#   source       = "./modules/secret_manager"
+#   project_name = var.project_name
+#   common_tags  = local.common_tags
+# }
 
 
 module "vpc" {

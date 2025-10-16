@@ -22,13 +22,13 @@ resource "aws_s3_bucket_cors_configuration" "img" {
   }
 }
 
-resource "aws_ssm_parameter" "AWS_STORAGE_BUCKET_NAME" {
-  name        = "/be/${terraform.workspace}/${var.project_name}/AWS_STORAGE_BUCKET_NAME"
-  description = "name of the bucket for storing images"
-  value       = aws_s3_bucket.img.id
-  type        = "SecureString"
-  tags        = var.common_tags
-}
+# resource "aws_ssm_parameter" "AWS_STORAGE_BUCKET_NAME" {
+#   name        = "/be/${terraform.workspace}/${var.project_name}/AWS_STORAGE_BUCKET_NAME"
+#   description = "name of the bucket for storing images"
+#   value       = aws_s3_bucket.img.id
+#   type        = "SecureString"
+#   tags        = var.common_tags
+# }
 
 resource "aws_s3_bucket_server_side_encryption_configuration" "s3_encryption" {
   bucket = aws_s3_bucket.img.id

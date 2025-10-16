@@ -144,7 +144,6 @@ jobs:
               terraform init
               terraform workspace select -or-create=true ${CIRCLE_BRANCH}
               terraform plan -input=false -var-file=environments/${CIRCLE_BRANCH}.tfvars
-              # terraform import module.secret_manager.aws_secretsmanager_secret.secret_backend arn:aws:secretsmanager:eu-west-1:639298159029:secret:production/vova/backend-57brS0 || true 
               terraform apply -auto-approve -var-file=environments/${CIRCLE_BRANCH}.tfvars
               cd ..
             fi
