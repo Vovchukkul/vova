@@ -33,7 +33,7 @@ resource "aws_iam_instance_profile" "bastion" {
 resource "aws_launch_template" "bastion" {
   name_prefix   = "${var.prefix}-bastion-lt"
   image_id      = data.aws_ami.amazon_linux.id
-  instance_type = "t3.nano"
+  instance_type = "t3.micro"
 
   iam_instance_profile {
     name = aws_iam_instance_profile.bastion.name

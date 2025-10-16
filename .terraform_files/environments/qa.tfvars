@@ -7,8 +7,9 @@ db_engine_version      = "16.10"
 db_instance_class      = "db.t4g.micro"
 db_storage             = 20
 db_max_storage         = 30
-db_username            = "admin"
-db_name                = "exhibition_db"
+db_username              = "qa-vova"
+db_name                  = "qa-vova"
+db_engine                = "postgres"
 
 app_port               = "8000"
 health_check_url       = "/health-check/"
