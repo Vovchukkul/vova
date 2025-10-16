@@ -65,20 +65,20 @@ resource "aws_security_group" "rds" {
   tags = var.common_tags
 }
 
-resource "aws_ssm_parameter" "DATABASE_HOST" {
-  name        = "/be/${terraform.workspace}/${var.project_name}/DATABASE_HOST"
+resource "aws_ssm_parameter" "POSTGRES_HOST" {
+  name        = "/be/${terraform.workspace}/${var.project_name}/POSTGRES_HOST"
   description = "Database host url"
   value       = aws_db_instance.db.address
   type        = "SecureString"
 }
-resource "aws_ssm_parameter" "DATABASE_NAME" {
-  name        = "/be/${terraform.workspace}/${var.project_name}/DATABASE_NAME"
+resource "aws_ssm_parameter" "POSTGRES_NAME" {
+  name        = "/be/${terraform.workspace}/${var.project_name}/POSTGRES_NAME"
   description = "Database user name"
   value       = aws_db_instance.db.db_name
   type        = "SecureString"
 }
-resource "aws_ssm_parameter" "DATABASE_PORT" {
-  name        = "/be/${terraform.workspace}/${var.project_name}/DATABASE_PORT"
+resource "aws_ssm_parameter" "POSTGRES_PORT" {
+  name        = "/be/${terraform.workspace}/${var.project_name}/POSTGRES_PORT"
   description = "Database port"
   value       = aws_db_instance.db.port
   type        = "SecureString"

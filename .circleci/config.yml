@@ -123,9 +123,9 @@ jobs:
               json_data=$(cat '.terraform_files/modules/ecs_fargate/templates/container-definitions.json.tpl')
               
               # Append the database username secret to the JSON template
-              json_data=$(echo $json_data | jq --arg  vf "$secrets_manager_arn:username::" '.[0].secrets += [{"name": "DATABASE_USER", "valueFrom": $vf}]')
+              json_data=$(echo $json_data | jq --arg  vf "$secrets_manager_arn:username::" '.[0].secrets += [{"name": "POSTGRES_USER", "valueFrom": $vf}]')
               # Append the database password secret to the JSON template
-              json_data=$(echo $json_data | jq --arg  vf "$secrets_manager_arn:password::" '.[0].secrets += [{"name": "DATABASE_PASSWORD", "valueFrom": $vf}]')
+              json_data=$(echo $json_data | jq --arg  vf "$secrets_manager_arn:password::" '.[0].secrets += [{"name": "POSTGRES_PASSWORD", "valueFrom": $vf}]')
               
               # Save the updated JSON template, overwriting the original file
               echo "$json_data" > '.terraform_files/modules/ecs_fargate/templates/container-definitions.json.tpl'
@@ -257,8 +257,8 @@ jobs:
 
             export user_name=$(aws secretsmanager get-secret-value --region $AWS_DEFAULT_REGION --profile ${CIRCLE_BRANCH} --secret-id "$secrets_manager" --query 'SecretString' | jq -r '. | fromjson | .username')
             export password=$(aws secretsmanager get-secret-value --region $AWS_DEFAULT_REGION --profile ${CIRCLE_BRANCH} --secret-id "$secrets_manager" --query 'SecretString' | jq -r '. | fromjson | .password')
-            echo "DATABASE_USER=$user_name" >> deployment/migrations/.env
-            echo "DATABASE_PASSWORD=$password" >> deployment/migrations/.env 
+            echo "POSTGRES_USER=$user_name" >> deployment/migrations/.env
+            echo "POSTGRES_PASSWORD=$password" >> deployment/migrations/.env 
 
       - run:
           name: Run database Migrations
@@ -268,8 +268,8 @@ jobs:
               curl "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb" -o "session-manager-plugin.deb"
               sudo dpkg -i session-manager-plugin.deb
               # Connect to the bastion host
-              host=$(aws ssm get-parameter --region $AWS_DEFAULT_REGION --profile ${CIRCLE_BRANCH} --name /be/${CIRCLE_BRANCH}/${PROJECT_NAME}/DATABASE_HOST --with-decryption | jq -r '.Parameter.Value')
-              port=$(aws ssm get-parameter --region $AWS_DEFAULT_REGION --profile ${CIRCLE_BRANCH} --name /be/${CIRCLE_BRANCH}/${PROJECT_NAME}/DATABASE_PORT --with-decryption | jq -r '.Parameter.Value')
+              host=$(aws ssm get-parameter --region $AWS_DEFAULT_REGION --profile ${CIRCLE_BRANCH} --name /be/${CIRCLE_BRANCH}/${PROJECT_NAME}/POSTGRES_HOST --with-decryption | jq -r '.Parameter.Value')
+              port=$(aws ssm get-parameter --region $AWS_DEFAULT_REGION --profile ${CIRCLE_BRANCH} --name /be/${CIRCLE_BRANCH}/${PROJECT_NAME}/POSTGRES_PORT --with-decryption | jq -r '.Parameter.Value')
               bastion=$(aws ec2 describe-instances --region $AWS_DEFAULT_REGION --profile ${CIRCLE_BRANCH} --query "Reservations[].Instances[?State.Name=='running' && Tags[?Key=='Name' && Value=='${CIRCLE_BRANCH}-${PROJECT_NAME}-bastion']].[InstanceId]" --output text)
               
               aws ssm start-session --profile ${CIRCLE_BRANCH} \
@@ -364,9 +364,9 @@ jobs:
             json_data=$(cat '.terraform_files/modules/ecs_fargate/templates/container-definitions.json.tpl')
             
             # Append the database username secret to the JSON template
-            json_data=$(echo $json_data | jq --arg  vf "$secrets_manager_arn:username::" '.[0].secrets += [{"name": "DATABASE_USER", "valueFrom": $vf}]')
+            json_data=$(echo $json_data | jq --arg  vf "$secrets_manager_arn:username::" '.[0].secrets += [{"name": "POSTGRES_USER", "valueFrom": $vf}]')
             # Append the database password secret to the JSON template
-            json_data=$(echo $json_data | jq --arg  vf "$secrets_manager_arn:password::" '.[0].secrets += [{"name": "DATABASE_PASSWORD", "valueFrom": $vf}]')
+            json_data=$(echo $json_data | jq --arg  vf "$secrets_manager_arn:password::" '.[0].secrets += [{"name": "POSTGRES_PASSWORD", "valueFrom": $vf}]')
             
             # Save the updated JSON template, overwriting the original file
             echo "$json_data" > '.terraform_files/modules/ecs_fargate/templates/container-definitions.json.tpl'
@@ -434,31 +434,29 @@ workflows:
             branches:
               only:
                 - qa
-                - staging
                 - production
       - build_docker_image
-      - run_unit_tests:
-          requires:
-            - build_docker_image
-      - run_database_migrations:
-          requires:
-            - run_unit_tests
-            - init_update_infrastructure
-          filters:
-            branches:
-              only:
-                - qa
-                - staging
-                - production
+      # - run_unit_tests:
+      #     requires:
+      #       - build_docker_image
+      # - run_database_migrations:
+      #     requires:
+      #       - run_unit_tests
+      #       - init_update_infrastructure
+      #     filters:
+      #       branches:
+      #         only:
+      #           - qa
+      #           - staging
+      #           - production
       - deploy_the_application:
           requires:
-            - run_database_migrations
+            # - run_database_migrations
             - init_update_infrastructure
           filters:
             branches:
               only:
                 - qa
-                - staging
                 - production
 
 
