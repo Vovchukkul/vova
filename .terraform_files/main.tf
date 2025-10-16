@@ -5,7 +5,7 @@ terraform {
     bucket               = "vova-tfstate" # Replace PROJECT_NAME with the name of your project
     workspace_key_prefix = "environments-backend"
     key                  = "resources.tfstate"
-    region               = "us-east-1" # Select your default region
+    region               = "eu-west-1" # Select your default region
     encrypt              = true
   }
 }
